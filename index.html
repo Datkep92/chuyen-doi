@@ -73,6 +73,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
 <script src="https://unpkg.com/docx@8.5.0/build/index.umd.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -115,6 +116,66 @@ function handleFile(f){
 $('btnAnalyze').addEventListener('click', analyze);
 $('btnReset').addEventListener('click', ()=>location.reload());
 
+let ocrWorker = null;
+async function getOcrWorker(){
+  if(ocrWorker) return ocrWorker;
+  log('Đang tải engine OCR (lần đầu có thể lâu)...');
+  ocrWorker = await Tesseract.createWorker('vie+eng', 1, {
+    logger: m => { if(m.status) log('OCR: ' + m.status + (m.progress? ' ' + Math.round(m.progress*100) + '%' : '')); }
+  });
+  return ocrWorker;
+}
+
+async function extractPageItems(page, pageNum){
+  const scale = 2;
+  const viewport = page.getViewport({scale});
+  // 1) Try embedded text
+  const tc = await page.getTextContent();
+  const items = [];
+  for(const it of tc.items){
+    if(!it.str || !it.str.trim()) continue;
+    const tx = pdfjsLib.Util.transform(viewport.transform, it.transform);
+    items.push({ text: it.str, x: tx[4], y: tx[5], w: (it.width||1)*viewport.scale, h: ((it.height||10))*viewport.scale });
+  }
+  const textLen = items.reduce((a,i)=>a+i.text.length,0);
+  if(textLen >= 30){
+    log('Trang ' + pageNum + ': text nhúng (' + items.length + ' đoạn).');
+    return items;
+  }
+  // 2) Fallback OCR for scanned pages
+  log('Trang ' + pageNum + ': ít text, dùng OCR...');
+  try {
+    const w = await getOcrWorker();
+    const canvas = document.createElement('canvas');
+    canvas.width = viewport.width; canvas.height = viewport.height;
+    const ctx = canvas.getContext('2d');
+    await page.render({canvasContext: ctx, viewport}).promise;
+    const { data } = await w.recognize(canvas);
+    const ocrItems = [];
+    if(data && data.words){
+      for(const wd of data.words){
+        if(!wd.text || !wd.text.trim()) continue;
+        const b = wd.bbox;
+        ocrItems.push({ text: wd.text, x: (b.x0+b.x1)/2, y: (b.y0+b.y1)/2, w: b.x1-b.x0, h: b.y1-b.y0 });
+      }
+    }
+    if(ocrItems.length===0 && data && data.text){
+      // fallback: split lines
+      const lines = data.text.split(/\n/);
+      let y = 20;
+      for(const ln of lines){
+        if(ln.trim()) ocrItems.push({ text: ln.trim(), x: 20, y, w: 10, h: 12 });
+        y += 16;
+      }
+    }
+    log('Trang ' + pageNum + ': OCR (' + ocrItems.length + ' từ).');
+    return ocrItems;
+  } catch(err){
+    log('Trang ' + pageNum + ': OCR lỗi - ' + err.message, 'err');
+    return items;
+  }
+}
+
 async function analyze(){
   if(!pdfDoc){ log('Chưa có PDF.', 'err'); return; }
   pagesData = [];
@@ -123,16 +184,10 @@ async function analyze(){
   const COL_TOL = 12, ROW_TOL = 8;
   for(let p=1; p<=pdfDoc.numPages; p++){
     const page = await pdfDoc.getPage(p);
-    const viewport = page.getViewport({scale:2});
-    const tc = await page.getTextContent();
-    const items = [];
-    for(const it of tc.items){
-      if(!it.str || !it.str.trim()) continue;
-      const tx = pdfjsLib.Util.transform(viewport.transform, it.transform);
-      items.push({ text: it.str, x: tx[4], y: tx[5], w: it.width*viewport.scale, h: (it.height||10)*viewport.scale });
-    }
-    if(items.length===0){ log('Trang ' + p + ' không có text (có thể là PDF scan ảnh).', 'err'); continue; }
-    // sắp xếp theo y rồi x để ghép chữ đúng thứ tự đọc
+    setProgress(Math.round((p-1)/pdfDoc.numPages*100));
+    log('Trang ' + p + ': đang trích xuất...');
+    const items = await extractPageItems(page, p);
+    if(items.length===0){ log('Trang ' + p + ' không có text (PDF scan và OCR thất bại).', 'err'); continue; }
     items.sort((a,b)=> a.y===b.y ? a.x-b.x : a.y-b.y);
     // cluster rows by y (gap-based)
     const ys = items.map(i=>i.y).sort((a,b)=>a-b);
