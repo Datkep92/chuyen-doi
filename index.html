@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chuyển PDF sang Word & Excel</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --accent:#3b82f6; --text:#e2e8f0; --muted:#94a3b8; --ok:#22c55e; --err:#ef4444; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background:var(--bg); color:var(--text); min-height:100vh; }
+  .wrap { max-width:900px; margin:0 auto; padding:24px 16px 60px; }
+  h1 { font-size:24px; margin:0 0 4px; }
+  .sub { color:var(--muted); font-size:14px; margin:0 0 20px; }
+  .card { background:var(--card); border-radius:14px; padding:20px; margin-bottom:16px; box-shadow:0 4px 20px rgba(0,0,0,.3); }
+  .drop { border:2px dashed #475569; border-radius:12px; padding:40px 20px; text-align:center; cursor:pointer; transition:.2s; }
+  .drop:hover, .drop.over { border-color:var(--accent); background:rgba(59,130,246,.08); }
+  .drop input { display:none; }
+  .btn { display:inline-flex; align-items:center; gap:8px; padding:10px 18px; border:none; border-radius:10px; background:var(--accent); color:#fff; font-size:15px; font-weight:600; cursor:pointer; transition:.15s; }
+  .btn:hover { filter:brightness(1.1); }
+  .btn:disabled { opacity:.5; cursor:not-allowed; }
+  .btn.secondary { background:#334155; }
+  .btn.success { background:var(--ok); }
+  .row { display:flex; gap:10px; flex-wrap:wrap; margin-top:12px; }
+  .progress { height:8px; background:#334155; border-radius:4px; overflow:hidden; margin-top:12px; }
+  .progress > div { height:100%; background:var(--accent); width:0%; transition:width .2s; }
+  .log { font-family:monospace; font-size:12px; color:var(--muted); max-height:160px; overflow:auto; background:#0b1220; padding:10px; border-radius:8px; margin-top:10px; white-space:pre-wrap; }
+  .preview { max-height:400px; overflow:auto; background:#0b1220; padding:12px; border-radius:8px; font-size:13px; line-height:1.5; }
+  .preview table { border-collapse:collapse; width:100%; margin:8px 0; }
+  .preview td { border:1px solid #334155; padding:4px 6px; }
+  .pill { display:inline-block; background:#334155; padding:2px 8px; border-radius:999px; font-size:12px; margin-right:6px; }
+  .err { color:var(--err); }
+  .ok { color:var(--ok); }
+  footer { color:var(--muted); font-size:12px; text-align:center; margin-top:24px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>📄 Chuyển PDF → Word / Excel</h1>
+  <p class="sub">Chạy hoàn toàn trên trình duyệt, không server. Giữ số liệu và bố cục tối đa có thể.</p>
+
+  <div class="card">
+    <label class="drop" id="drop">
+      <input type="file" id="file" accept="application/pdf">
+      <div id="dropText">Kéo thả file PDF vào đây, hoặc bấm để chọn</div>
+      <div style="margin-top:8px;color:var(--muted);font-size:13px">Hỗ trợ PDF có text (không phải scan ảnh)</div>
+    </label>
+    <div class="row">
+      <button class="btn" id="btnAnalyze" disabled>🔍 Phân tích PDF</button>
+      <button class="btn secondary" id="btnReset">↺ Làm lại</button>
+    </div>
+    <div class="progress"><div id="bar"></div></div>
+    <div class="log" id="log"></div>
+  </div>
+
+  <div class="card" id="infoCard" style="display:none">
+    <div id="info"></div>
+    <div class="row">
+      <button class="btn success" id="btnWord">⬇ Xuất Word (.docx)</button>
+      <button class="btn success" id="btnExcel">⬇ Xuất Excel (.xlsx)</button>
+    </div>
+  </div>
+
+  <div class="card" id="previewCard" style="display:none">
+    <h3 style="margin:0 0 8px">Xem trước (trang 1)</h3>
+    <div class="preview" id="preview"></div>
+  </div>
+
+  <footer>Powered by pdf.js · SheetJS · docx.js — chạy local, dữ liệu không rời máy.</footer>
+</div>
+
+<!-- Libraries -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
+<script src="https://unpkg.com/docx@8.5.0/build/index.umd.js"></script>
+
+<script>
+const $ = id => document.getElementById(id);
+const logEl = $('log');
+function log(msg, cls){ const d=document.createElement('div'); if(cls)d.className=cls; d.textContent=msg; logEl.appendChild(d); logEl.scrollTop=logEl.scrollHeight; }
+function setProgress(p){ $('bar').style.width = p+'%'; }
+
+pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+let pdfDoc = null;
+let pagesData = []; // [{pageNum, rows:[[]], lines:[{text,y}], colsCount}]
+
+const drop = $('drop');
+const fileInput = $('file');
+drop.addEventListener('click', ()=>fileInput.click());
+drop.addEventListener('dragover', e=>{e.preventDefault(); drop.classList.add('over');});
+drop.addEventListener('dragleave', ()=>drop.classList.remove('over'));
+drop.addEventListener('drop', e=>{e.preventDefault(); drop.classList.remove('over'); if(e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);});
+fileInput.addEventListener('change', e=>{ if(e.target.files[0]) handleFile(e.target.files[0]); });
+
+function handleFile(f){
+  if(!f || f.type!=='application/pdf'){ log('Chỉ chấp nhận file PDF.', 'err'); return; }
+  $('dropText').textContent = f.name + ' (' + (f.size/1024/1024).toFixed(2) + ' MB)';
+  const r = new FileReader();
+  r.onload = async e => {
+    try {
+      const data = new Uint8Array(e.target.result);
+      pdfDoc = await pdfjsLib.getDocument({data}).promise;
+      log('Đã mở PDF: ' + pdfDoc.numPages + ' trang.', 'ok');
+      $('btnAnalyze').disabled = false;
+    } catch(err){ log('Lỗi mở PDF: ' + err.message, 'err'); }
+  };
+  r.readAsArrayBuffer(f);
+}
+
+$('btnAnalyze').addEventListener('click', analyze);
+$('btnReset').addEventListener('click', ()=>location.reload());
+
+async function analyze(){
+  if(!pdfDoc){ log('Chưa có PDF.', 'err'); return; }
+  pagesData = [];
+  setProgress(0);
+  log('Bắt đầu phân tích...');
+  const COL_TOL = 12, ROW_TOL = 8;
+  for(let p=1; p<=pdfDoc.numPages; p++){
+    const page = await pdfDoc.getPage(p);
+    const viewport = page.getViewport({scale:2});
+    const tc = await page.getTextContent();
+    const items = [];
+    for(const it of tc.items){
+      if(!it.str || !it.str.trim()) continue;
+      const tx = pdfjsLib.Util.transform(viewport.transform, it.transform);
+      items.push({ text: it.str, x: tx[4], y: tx[5], w: it.width*viewport.scale, h: (it.height||10)*viewport.scale });
+    }
+    if(items.length===0){ log('Trang ' + p + ' không có text (có thể là PDF scan ảnh).', 'err'); continue; }
+    // sắp xếp theo y rồi x để ghép chữ đúng thứ tự đọc
+    items.sort((a,b)=> a.y===b.y ? a.x-b.x : a.y-b.y);
+    // cluster rows by y (gap-based)
+    const ys = items.map(i=>i.y).sort((a,b)=>a-b);
+    const rowCenters = [];
+    for(const y of ys){
+      if(!rowCenters.length || y - rowCenters[rowCenters.length-1] > ROW_TOL){
+        rowCenters.push(y);
+      } else {
+        rowCenters[rowCenters.length-1] = (rowCenters[rowCenters.length-1]+y)/2;
+      }
+    }
+    // cluster cols by x (gap-based)
+    const xs = items.map(i=>i.x).sort((a,b)=>a-b);
+    const colCenters = [];
+    for(const x of xs){
+      if(!colCenters.length || x - colCenters[colCenters.length-1] > COL_TOL){
+        colCenters.push(x);
+      } else {
+        colCenters[colCenters.length-1] = (colCenters[colCenters.length-1]+x)/2;
+      }
+    }
+
+    const grid = rowCenters.map(()=>colCenters.map(()=>''));
+    for(const it of items){
+      let ri = rowCenters.reduce((best,i,idx)=> Math.abs(rowCenters[idx]-it.y) < Math.abs(rowCenters[best]-it.y) ? idx : best, 0);
+      let ci = colCenters.reduce((best,i,idx)=> Math.abs(colCenters[idx]-it.x) < Math.abs(colCenters[best]-it.x) ? idx : best, 0);
+      const cell = grid[ri][ci];
+      grid[ri][ci] = cell ? cell + ' ' + it.text : it.text;
+    }
+    // trim empty trailing rows/cols
+    // rows
+    while(grid.length && grid[grid.length-1].every(c=>!c.trim())) grid.pop();
+    // cols
+    let maxCol = 0;
+    for(const r of grid) for(let c=0;c<r.length;c++) if(r[c].trim()) maxCol=Math.max(maxCol,c);
+    const trimmed = grid.map(r=>r.slice(0,maxCol+1));
+    // convert numbers
+    const typed = trimmed.map(r=>r.map(v=>{
+      const t = v.trim();
+      if(t==='' ) return '';
+      // number detection
+      const cleaned = t.replace(/\s/g,'').replace(/,/g,'');
+      if(/^[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?$/.test(cleaned) && cleaned!=='' && cleaned!=='.' && cleaned!=='-' && cleaned!=='+' ){
+        const n = Number(cleaned);
+        if(isFinite(n)) return n;
+      }
+      return t;
+    }));
+    pagesData.push({ pageNum:p, grid:typed, rows:typed.length, cols: (typed[0]?.length||0) });
+    setProgress(Math.round(p/pdfDoc.numPages*100));
+    log('Trang ' + p + ': ' + typed.length + ' dòng, ' + (typed[0]?.length||0) + ' cột.');
+  }
+  setProgress(100);
+  log('Phân tích xong.', 'ok');
+  showInfo();
+  showPreview();
+}
+
+function showInfo(){
+  const totalRows = pagesData.reduce((a,p)=>a+p.rows,0);
+  const maxCols = Math.max(...pagesData.map(p=>p.cols));
+  $('info').innerHTML = pagesData.map(p=>`<span class="pill">Trang ${p.pageNum}: ${p.rows} dòng × ${p.cols} cột</span>`).join('') +
+    `<div style="margin-top:8px;color:var(--muted)">Tổng: ${pagesData.length} trang, ${totalRows} dòng, tối đa ${maxCols} cột.</div>`;
+  $('infoCard').style.display='block';
+}
+
+function showPreview(){
+  const p = pagesData[0];
+  if(!p) return;
+  let html = '<table>';
+  const maxR = Math.min(p.grid.length, 25);
+  for(let r=0;r<maxR;r++){
+    html += '<tr>';
+    for(let c=0;c<p.grid[r].length;c++){
+      html += '<td>' + escapeHtml(String(p.grid[r][c])) + '</td>';
+    }
+    html += '</tr>';
+  }
+  html += '</table>';
+  if(p.grid.length>25) html += '<div style="color:var(--muted)">... còn ' + (p.grid.length-25) + ' dòng</div>';
+  $('preview').innerHTML = html;
+  $('previewCard').style.display='block';
+}
+function escapeHtml(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+// ---- Export Excel ----
+$('btnExcel').addEventListener('click', exportExcel);
+function exportExcel(){
+  try {
+    const wb = XLSX.utils.book_new();
+    pagesData.forEach((p, idx) => {
+      const ws = XLSX.utils.aoa_to_sheet(p.grid);
+      // set column widths
+      const ncols = p.grid.reduce((a,r)=>Math.max(a,r.length),0);
+      ws['!cols'] = Array.from({length:ncols}, (_,c)=>{
+        let max=8;
+        for(const r of p.grid) if(r[c]!=null){ const l=String(r[c]).length; if(l>max) max=Math.min(l,40); }
+        return {wch:max+2};
+      });
+      const name = 'Trang ' + p.pageNum;
+      XLSX.utils.book_append_sheet(wb, ws, name.slice(0,31));
+    });
+    const out = XLSX.write(wb, {bookType:'xlsx', type:'array'});
+    downloadBlob(new Blob([out], {type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}), 'converted.xlsx');
+    log('Đã xuất Excel.', 'ok');
+  } catch(e){ log('Lỗi xuất Excel: ' + e.message, 'err'); }
+}
+
+// ---- Export Word ----
+$('btnWord').addEventListener('click', exportWord);
+async function exportWord(){
+  try {
+    const { Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell, WidthType, HeadingLevel, PageBreak } = docx;
+    const sections = [];
+    const children = [];
+    pagesData.forEach((p, idx) => {
+      if(idx>0) children.push(new Paragraph({children:[new PageBreak()]}));
+      children.push(new Paragraph({ text: 'Trang ' + p.pageNum, heading: HeadingLevel.HEADING_2 }));
+      // decide table vs paragraphs
+      const ncols = p.grid.reduce((a,r)=>Math.max(a,r.length),0);
+      const nonEmptyRows = p.grid.filter(r=>r.some(c=>String(c).trim()!==''));
+      const avgCols = nonEmptyRows.reduce((a,r)=>a + r.filter(c=>String(c).trim()!=='').length,0)/Math.max(nonEmptyRows.length,1);
+      const isTable = ncols >= 2 && nonEmptyRows.length>=2 && avgCols >= 1.5;
+      if(isTable){
+        const rows = nonEmptyRows.map(r => new TableRow({
+          children: Array.from({length:ncols}, (_,c) => new TableCell({
+            children: [ new Paragraph({ children:[ new TextRun({ text: String(r[c]??'') }) ] }) ],
+            width: { size: Math.floor(9000/ncols), type: WidthType.DXA }
+          }))
+        }));
+        children.push(new Table({ rows, width:{size:9000, type:WidthType.DXA} }));
+      } else {
+        for(const r of p.grid){
+          const line = r.map(c=>String(c)).join(' ').trim();
+          if(line) children.push(new Paragraph({ children:[ new TextRun(line) ] }));
+        }
+      }
+    });
+    const doc = new Document({ sections:[{ children }] });
+    const blob = await Packer.toBlob(doc);
+    downloadBlob(blob, 'converted.docx');
+    log('Đã xuất Word.', 'ok');
+  } catch(e){ log('Lỗi xuất Word: ' + e.message, 'err'); console.error(e); }
+}
+
+function downloadBlob(blob, name){
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click();
+  setTimeout(()=>{ URL.revokeObjectURL(url); a.remove(); }, 1000);
+}
+</script>
+</body>
+</html>
