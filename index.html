@@ -45,6 +45,7 @@
       <div style="margin-top:8px;color:var(--muted);font-size:13px">Hỗ trợ PDF có text (không phải scan ảnh)</div>
     </label>
     <div class="row">
+      <button class="btn" id="btnPick">📂 Chọn file PDF</button>
       <button class="btn" id="btnAnalyze" disabled>🔍 Phân tích PDF</button>
       <button class="btn secondary" id="btnReset">↺ Làm lại</button>
     </div>
@@ -91,11 +92,15 @@ drop.addEventListener('dragover', e=>{e.preventDefault(); drop.classList.add('ov
 drop.addEventListener('dragleave', ()=>drop.classList.remove('over'));
 drop.addEventListener('drop', e=>{e.preventDefault(); drop.classList.remove('over'); if(e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);});
 fileInput.addEventListener('change', e=>{ if(e.target.files[0]) handleFile(e.target.files[0]); });
+$('btnPick').addEventListener('click', ()=>fileInput.click());
 
 function handleFile(f){
-  if(!f || f.type!=='application/pdf'){ log('Chỉ chấp nhận file PDF.', 'err'); return; }
+  if(!f){ log('Không có file.', 'err'); return; }
+  const isPdf = f.type==='application/pdf' || /\.pdf$/i.test(f.name||'');
+  if(!isPdf){ log('Chỉ chấp nhận file PDF. (type=' + (f.type||'') + ')', 'err'); return; }
   $('dropText').textContent = f.name + ' (' + (f.size/1024/1024).toFixed(2) + ' MB)';
   const r = new FileReader();
+  r.onerror = () => log('Lỗi đọc file: ' + (r.error && r.error.message), 'err');
   r.onload = async e => {
     try {
       const data = new Uint8Array(e.target.result);
