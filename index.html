@@ -40,7 +40,7 @@
 
   <div class="card">
     <label class="drop" id="drop">
-      <input type="file" id="file" accept="application/pdf">
+      <input type="file" id="file" accept="application/pdf,.pdf">
       <div id="dropText">Kéo thả file PDF vào đây, hoặc bấm để chọn</div>
       <div style="margin-top:8px;color:var(--muted);font-size:13px">Hỗ trợ PDF có text (không phải scan ảnh)</div>
     </label>
@@ -156,7 +156,7 @@ async function extractPageItems(page, pageNum){
       for(const wd of data.words){
         if(!wd.text || !wd.text.trim()) continue;
         const b = wd.bbox;
-        ocrItems.push({ text: wd.text, x: (b.x0+b.x1)/2, y: (b.y0+b.y1)/2, w: b.x1-b.x0, h: b.y1-b.y0 });
+        ocrItems.push({ text: wd.text, x: b.x0, y: b.y0, w: b.x1-b.x0, h: b.y1-b.y0 });
       }
     }
     if(ocrItems.length===0 && data && data.text){
@@ -189,20 +189,44 @@ async function analyze(){
     const items = await extractPageItems(page, p);
     if(items.length===0){ log('Trang ' + p + ' không có text (PDF scan và OCR thất bại).', 'err'); continue; }
     items.sort((a,b)=> a.y===b.y ? a.x-b.x : a.y-b.y);
-    // cluster rows by y (gap-based)
-    const ys = items.map(i=>i.y).sort((a,b)=>a-b);
-    const rowCenters = [];
-    for(const y of ys){
-      if(!rowCenters.length || y - rowCenters[rowCenters.length-1] > ROW_TOL){
-        rowCenters.push(y);
+    // ---- Group into lines by Y ----
+    const lines = [];
+    for(const it of items){
+      const last = lines[lines.length-1];
+      if(last && Math.abs(last.y - it.y) <= ROW_TOL){
+        last.items.push(it);
+        last.y = (last.y + it.y)/2;
       } else {
-        rowCenters[rowCenters.length-1] = (rowCenters[rowCenters.length-1]+y)/2;
+        lines.push({ y: it.y, items: [it] });
       }
     }
-    // cluster cols by x (gap-based)
-    const xs = items.map(i=>i.x).sort((a,b)=>a-b);
+    // sort items in each line by x
+    for(const ln of lines) ln.items.sort((a,b)=>a.x-b.x);
+
+    // ---- Split each line into cells by large horizontal gaps ----
+    const GAP_SPLIT = 15;
+    const lineCells = lines.map(ln => {
+      const cells = [];
+      let cur = [ln.items[0]];
+      for(let i=1;i<ln.items.length;i++){
+        const prev = ln.items[i-1];
+        const gap = ln.items[i].x - (prev.x + (prev.w||0));
+        if(gap > GAP_SPLIT){
+          cells.push(cur); cur = [ln.items[i]];
+        } else {
+          cur.push(ln.items[i]);
+        }
+      }
+      if(cur.length) cells.push(cur);
+      return { y: ln.y, cells: cells.map(c => ({ x: c[0].x, text: c.map(i=>i.text).join(' ').trim() })) };
+    }).filter(lc => lc.cells.some(c=>c.text.trim()));
+
+    // ---- Cluster column boundaries across all lines ----
+    const boundaries = [];
+    for(const lc of lineCells) for(const c of lc.cells) boundaries.push(c.x);
+    boundaries.sort((a,b)=>a-b);
     const colCenters = [];
-    for(const x of xs){
+    for(const x of boundaries){
       if(!colCenters.length || x - colCenters[colCenters.length-1] > COL_TOL){
         colCenters.push(x);
       } else {
@@ -210,32 +234,68 @@ async function analyze(){
       }
     }
 
-    const grid = rowCenters.map(()=>colCenters.map(()=>''));
-    for(const it of items){
-      let ri = rowCenters.reduce((best,i,idx)=> Math.abs(rowCenters[idx]-it.y) < Math.abs(rowCenters[best]-it.y) ? idx : best, 0);
-      let ci = colCenters.reduce((best,i,idx)=> Math.abs(colCenters[idx]-it.x) < Math.abs(colCenters[best]-it.x) ? idx : best, 0);
-      const cell = grid[ri][ci];
-      grid[ri][ci] = cell ? cell + ' ' + it.text : it.text;
-    }
+    // ---- Build grid ----
+    const grid = lineCells.map(lc => {
+      const row = colCenters.map(()=>'');
+      for(const c of lc.cells){
+        // nearest column
+        let ci = 0, best = Infinity;
+        for(let k=0;k<colCenters.length;k++){
+          const d = Math.abs(colCenters[k]-c.x);
+          if(d < best){ best=d; ci=k; }
+        }
+        row[ci] = row[ci] ? row[ci] + ' ' + c.text : c.text;
+      }
+      return row;
+    });
+
     // trim empty trailing rows/cols
-    // rows
-    while(grid.length && grid[grid.length-1].every(c=>!c.trim())) grid.pop();
-    // cols
+    while(grid.length && grid[grid.length-1].every(c=>!String(c).trim())) grid.pop();
     let maxCol = 0;
-    for(const r of grid) for(let c=0;c<r.length;c++) if(r[c].trim()) maxCol=Math.max(maxCol,c);
+    for(const r of grid) for(let c=0;c<r.length;c++) if(String(r[c]).trim()) maxCol=Math.max(maxCol,c);
     const trimmed = grid.map(r=>r.slice(0,maxCol+1));
-    // convert numbers
-    const typed = trimmed.map(r=>r.map(v=>{
-      const t = v.trim();
-      if(t==='' ) return '';
-      // number detection
-      const cleaned = t.replace(/\s/g,'').replace(/,/g,'');
-      if(/^[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?$/.test(cleaned) && cleaned!=='' && cleaned!=='.' && cleaned!=='-' && cleaned!=='+' ){
-        const n = Number(cleaned);
+
+    // detect document number format
+    const allText = items.map(i=>i.text).join(' ');
+    let numFormat = 'auto';
+    if(/\d\.\d{3},\d/.test(allText)) numFormat = 'eu';
+    else if(/\d,\d{3}\.\d/.test(allText)) numFormat = 'us';
+
+    // number parsing: support both 1,234.56 and 1.234,56
+    function parseNumber(str){
+      const t = str.trim();
+      if(t==='') return '';
+      const noSpace = t.replace(/\s/g,'');
+      let s = noSpace;
+      // preserve leading-zero codes (e.g. 0002, 00221556)
+      if(/^0\d/.test(s) && s!=='0') return t;
+      const hasComma = s.includes(',');
+      const hasDot = s.includes('.');
+      if(numFormat === 'eu'){
+        if(hasComma){ s = s.replace(/\./g,'').replace(',','.'); }
+        else if(hasDot && /^\d{1,3}(\.\d{3})+$/.test(s)){ s = s.replace(/\./g,''); }
+      } else if(numFormat === 'us'){
+        if(hasComma){ s = s.replace(/,/g,''); }
+        // dot stays decimal
+      } else {
+        if(hasComma && hasDot){
+          if(s.lastIndexOf(',') > s.lastIndexOf('.')){ s = s.replace(/\./g,'').replace(',','.'); }
+          else { s = s.replace(/,/g,''); }
+        } else if(hasComma && !hasDot){
+          if(/^\d{1,3}(,\d{3})+$/.test(s)){ s = s.replace(/,/g,''); }
+          else { s = s.replace(',','.'); }
+        } else if(hasDot && !hasComma){
+          if(/^\d{1,3}(\.\d{3})+$/.test(s)){ s = s.replace(/\./g,''); }
+        }
+      }
+      if(/^[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?$/.test(s) && s!=='' && s!=='.' && s!=='-' && s!=='+' ){
+        const n = Number(s);
         if(isFinite(n)) return n;
       }
       return t;
-    }));
+    }
+
+    const typed = trimmed.map(r=>r.map(v=> parseNumber(String(v))));
     pagesData.push({ pageNum:p, grid:typed, rows:typed.length, cols: (typed[0]?.length||0) });
     setProgress(Math.round(p/pdfDoc.numPages*100));
     log('Trang ' + p + ': ' + typed.length + ' dòng, ' + (typed[0]?.length||0) + ' cột.');
