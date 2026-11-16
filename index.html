@@ -35,18 +35,18 @@
 </head>
 <body>
 <div class="wrap">
-  <h1>📄 Chuyển PDF → Word / Excel</h1>
-  <p class="sub">Chạy hoàn toàn trên trình duyệt, không server. Giữ số liệu và bố cục tối đa có thể.</p>
+  <h1>📄 Chuyển PDF / Ảnh → Word / Excel</h1>
+  <p class="sub">Chạy hoàn toàn trên trình duyệt, không server xử lý. Giữ số liệu và bố cục tối đa có thể. Hỗ trợ PDF có text, PDF scan ảnh và ảnh chụp.</p>
 
   <div class="card">
     <label class="drop" id="drop">
-      <input type="file" id="file" accept="application/pdf,.pdf">
-      <div id="dropText">Kéo thả file PDF vào đây, hoặc bấm để chọn</div>
-      <div style="margin-top:8px;color:var(--muted);font-size:13px">Hỗ trợ PDF có text hoặc scan ảnh (OCR tự động)</div>
+      <input type="file" id="file" accept="application/pdf,.pdf,image/*">
+      <div id="dropText">Kéo thả file PDF/ảnh vào đây, hoặc bấm để chọn</div>
+      <div style="margin-top:8px;color:var(--muted);font-size:13px">Hỗ trợ PDF text, PDF scan ảnh (OCR tự động) và ảnh PNG/JPG</div>
     </label>
     <div class="row">
-      <button class="btn" id="btnPick">📂 Chọn file PDF</button>
-      <button class="btn" id="btnAnalyze" disabled>🔍 Phân tích PDF</button>
+      <button class="btn" id="btnPick">📂 Chọn file</button>
+      <button class="btn" id="btnAnalyze" disabled>🔍 Phân tích</button>
       <button class="btn secondary" id="btnReset">↺ Làm lại</button>
     </div>
     <div class="progress"><div id="bar"></div></div>
@@ -58,6 +58,7 @@
     <div class="row">
       <button class="btn success" id="btnWord">⬇ Xuất Word (.docx)</button>
       <button class="btn success" id="btnExcel">⬇ Xuất Excel (.xlsx)</button>
+      <button class="btn secondary" id="btnJson">⬇ Xuất JSON (kiểm tra)</button>
     </div>
   </div>
 
@@ -66,7 +67,7 @@
     <div class="preview" id="preview"></div>
   </div>
 
-  <footer>Powered by pdf.js · SheetJS · docx.js — chạy local, dữ liệu không rời máy.</footer>
+  <footer>Powered by pdf.js · SheetJS · docx.js · PaddleOCR — chạy local, dữ liệu không rời máy.</footer>
 </div>
 
 <!-- Libraries -->
@@ -80,11 +81,15 @@ const $ = id => document.getElementById(id);
 const logEl = $('log');
 function log(msg, cls){ const d=document.createElement('div'); if(cls)d.className=cls; d.textContent=msg; logEl.appendChild(d); logEl.scrollTop=logEl.scrollHeight; }
 function setProgress(p){ $('bar').style.width = p+'%'; }
+function escapeHtml(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
 let pdfDoc = null;
-let pagesData = []; // [{pageNum, rows:[[]], lines:[{text,y}], colsCount}]
+let imageFile = null;
+let fileType = 'pdf'; // 'pdf' | 'image'
+let pagesData = []; // normalized page records
+let ocrEngine = null;
 
 const drop = $('drop');
 const fileInput = $('file');
@@ -94,29 +99,42 @@ drop.addEventListener('dragleave', ()=>drop.classList.remove('over'));
 drop.addEventListener('drop', e=>{e.preventDefault(); drop.classList.remove('over'); if(e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);});
 fileInput.addEventListener('change', e=>{ if(e.target.files[0]) handleFile(e.target.files[0]); });
 $('btnPick').addEventListener('click', ()=>fileInput.click());
+$('btnReset').addEventListener('click', ()=>location.reload());
+
+function isPdfFile(f){
+  return f.type==='application/pdf' || /\.pdf$/i.test(f.name||'');
+}
+function isImageFile(f){
+  return /^image\//i.test(f.type||'') || /\.(png|jpe?g|webp|bmp|gif)$/i.test(f.name||'');
+}
 
 function handleFile(f){
   if(!f){ log('Không có file.', 'err'); return; }
-  const isPdf = f.type==='application/pdf' || /\.pdf$/i.test(f.name||'');
-  if(!isPdf){ log('Chỉ chấp nhận file PDF. (type=' + (f.type||'') + ')', 'err'); return; }
+  if(!isPdfFile(f) && !isImageFile(f)){ log('Chỉ chấp nhận PDF hoặc ảnh. (type=' + (f.type||'') + ')', 'err'); return; }
   $('dropText').textContent = f.name + ' (' + (f.size/1024/1024).toFixed(2) + ' MB)';
-  const r = new FileReader();
-  r.onerror = () => log('Lỗi đọc file: ' + (r.error && r.error.message), 'err');
-  r.onload = async e => {
-    try {
-      const data = new Uint8Array(e.target.result);
-      pdfDoc = await pdfjsLib.getDocument({data}).promise;
-      log('Đã mở PDF: ' + pdfDoc.numPages + ' trang.', 'ok');
-      $('btnAnalyze').disabled = false;
-    } catch(err){ log('Lỗi mở PDF: ' + err.message, 'err'); }
-  };
-  r.readAsArrayBuffer(f);
+  if(isPdfFile(f)){
+    fileType = 'pdf';
+    pdfDoc = null; imageFile = null;
+    const r = new FileReader();
+    r.onerror = () => log('Lỗi đọc file: ' + (r.error && r.error.message), 'err');
+    r.onload = async e => {
+      try {
+        const data = new Uint8Array(e.target.result);
+        pdfDoc = await pdfjsLib.getDocument({data}).promise;
+        log('Đã mở PDF: ' + pdfDoc.numPages + ' trang.', 'ok');
+        $('btnAnalyze').disabled = false;
+      } catch(err){ log('Lỗi mở PDF: ' + err.message, 'err'); }
+    };
+    r.readAsArrayBuffer(f);
+  } else {
+    fileType = 'image';
+    imageFile = f;
+    pdfDoc = null;
+    log('Đã chọn ảnh: ' + f.name, 'ok');
+    $('btnAnalyze').disabled = false;
+  }
 }
 
-$('btnAnalyze').addEventListener('click', analyze);
-$('btnReset').addEventListener('click', ()=>location.reload());
-
-let ocrEngine = null;
 async function getOcrEngine(){
   if(ocrEngine) return ocrEngine;
   log('Đang tải engine OCR PaddleOCR (lần đầu có thể lâu)...');
@@ -133,7 +151,38 @@ async function getOcrEngine(){
   return ocrEngine;
 }
 
-async function extractPageItems(page, pageNum){
+function mapOcrResult(result){
+  const texts = (result && result.texts) ? result.texts : (Array.isArray(result) ? result : []);
+  const out = [];
+  for(const t of texts){
+    if(!t || !t.text || !t.text.trim()) continue;
+    let box = t.box;
+    if(!box || !box.length){
+      if(t.frame){
+        box = [
+          [t.frame.left, t.frame.top],
+          [t.frame.left + t.frame.width, t.frame.top],
+          [t.frame.left + t.frame.width, t.frame.top + t.frame.height],
+          [t.frame.left, t.frame.top + t.frame.height]
+        ];
+      }
+    }
+    if(!box || !box.length){
+      out.push({ text: t.text.trim(), x: 20, y: 20, w: 10, h: 12 });
+      continue;
+    }
+    const xs = box.map(p=>p[0]);
+    const ys = box.map(p=>p[1]);
+    const x = Math.min(...xs);
+    const y = Math.min(...ys);
+    const w = Math.max(...xs) - x;
+    const h = Math.max(...ys) - y;
+    out.push({ text: t.text.trim(), x, y, w: w||10, h: h||12 });
+  }
+  return out;
+}
+
+async function extractPdfPage(page, pageNum){
   const scale = 3;
   const viewport = page.getViewport({scale});
   // 1) Try embedded text
@@ -147,7 +196,7 @@ async function extractPageItems(page, pageNum){
   const textLen = items.reduce((a,i)=>a+i.text.length,0);
   if(textLen >= 30){
     log('Trang ' + pageNum + ': text nhúng (' + items.length + ' đoạn).');
-    return items;
+    return { items, sourceType:'pdf-text', width: viewport.width, height: viewport.height };
   }
   // 2) Fallback OCR for scanned pages
   log('Trang ' + pageNum + ': ít text, dùng OCR...');
@@ -159,166 +208,189 @@ async function extractPageItems(page, pageNum){
     await page.render({canvasContext: ctx, viewport}).promise;
     const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
     const result = await ocr.detect({ data: imageData.data, width: imageData.width, height: imageData.height });
-    const ocrItems = [];
-    const texts = (result && result.texts) ? result.texts : (Array.isArray(result) ? result : []);
-    for(const t of texts){
-      if(!t || !t.text || !t.text.trim()) continue;
-      let box = t.box;
-      if(!box || !box.length){
-        // fallback: use frame if provided
-        if(t.frame){
-          box = [
-            [t.frame.left, t.frame.top],
-            [t.frame.left + t.frame.width, t.frame.top],
-            [t.frame.left + t.frame.width, t.frame.top + t.frame.height],
-            [t.frame.left, t.frame.top + t.frame.height]
-          ];
-        }
-      }
-      if(!box || !box.length){
-        ocrItems.push({ text: t.text.trim(), x: 20, y: 20, w: 10, h: 12 });
-        continue;
-      }
-      const xs = box.map(p=>p[0]);
-      const ys = box.map(p=>p[1]);
-      const x = Math.min(...xs);
-      const y = Math.min(...ys);
-      const w = Math.max(...xs) - x;
-      const h = Math.max(...ys) - y;
-      ocrItems.push({ text: t.text.trim(), x, y, w: w||10, h: h||12 });
-    }
+    const ocrItems = mapOcrResult(result);
     log('Trang ' + pageNum + ': OCR (' + ocrItems.length + ' dòng).');
-    return ocrItems;
+    return { items: ocrItems, sourceType:'pdf-scan', width: viewport.width, height: viewport.height };
   } catch(err){
     log('Trang ' + pageNum + ': OCR lỗi - ' + err.message, 'err');
     console.error(err);
-    return items;
+    return { items, sourceType:'pdf-scan', width: viewport.width, height: viewport.height };
   }
 }
 
+async function extractImageItems(file){
+  const url = URL.createObjectURL(file);
+  const img = await new Promise((resolve, reject)=>{
+    const i = new Image();
+    i.onload = ()=>resolve(i);
+    i.onerror = reject;
+    i.src = url;
+  });
+  const canvas = document.createElement('canvas');
+  canvas.width = img.naturalWidth; canvas.height = img.naturalHeight;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(img, 0, 0);
+  URL.revokeObjectURL(url);
+  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const ocr = await getOcrEngine();
+  const result = await ocr.detect({ data: imageData.data, width: imageData.width, height: imageData.height });
+  const items = mapOcrResult(result);
+  log('Ảnh: OCR (' + items.length + ' dòng).');
+  return { items, sourceType:'image', width: canvas.width, height: canvas.height };
+}
+
+function processPage(pageNum, items, width, height, sourceType){
+  if(!items || !items.length){ log('Trang ' + pageNum + ' không có text.', 'err'); return; }
+  const sorted = items.slice().sort((a,b)=> a.y===b.y ? a.x-b.x : a.y-b.y);
+
+  const heights = sorted.map(i=>i.h).filter(h=>h>0).sort((a,b)=>a-b);
+  const medH = heights.length ? heights[Math.floor(heights.length/2)] : 12;
+  const ROW_TOL = Math.max(6, Math.min(20, medH*0.65));
+
+  // Group into lines by Y
+  const lines = [];
+  for(const it of sorted){
+    const last = lines[lines.length-1];
+    if(last && Math.abs(last.y - it.y) <= ROW_TOL){
+      last.items.push(it);
+      last.y = (last.y + it.y)/2;
+    } else {
+      lines.push({ y: it.y, items: [it] });
+    }
+  }
+  for(const ln of lines) ln.items.sort((a,b)=>a.x-b.x);
+
+  // Split each line into cells by large horizontal gaps
+  const GAP_SPLIT = Math.max(12, Math.min(24, medH*0.9));
+  const lineCells = lines.map(ln => {
+    const cells = [];
+    let cur = [ln.items[0]];
+    for(let i=1;i<ln.items.length;i++){
+      const prev = ln.items[i-1];
+      const gap = ln.items[i].x - (prev.x + (prev.w||0));
+      if(gap > GAP_SPLIT){
+        cells.push(cur); cur = [ln.items[i]];
+      } else {
+        cur.push(ln.items[i]);
+      }
+    }
+    if(cur.length) cells.push(cur);
+    return { y: ln.y, cells: cells.map(c => ({ x: c[0].x, text: c.map(i=>i.text).join(' ').trim() })) };
+  }).filter(lc => lc.cells.some(c=>c.text.trim()));
+
+  // Cluster column boundaries across all lines
+  const COL_TOL = Math.max(12, Math.min(24, medH*1.1));
+  const boundaries = [];
+  for(const lc of lineCells) for(const c of lc.cells) boundaries.push(c.x);
+  boundaries.sort((a,b)=>a-b);
+  const colCenters = [];
+  for(const x of boundaries){
+    if(!colCenters.length || x - colCenters[colCenters.length-1] > COL_TOL){
+      colCenters.push(x);
+    } else {
+      colCenters[colCenters.length-1] = (colCenters[colCenters.length-1]+x)/2;
+    }
+  }
+
+  // Build grid
+  const grid = lineCells.map(lc => {
+    const row = colCenters.map(()=>'');
+    for(const c of lc.cells){
+      let ci = 0, best = Infinity;
+      for(let k=0;k<colCenters.length;k++){
+        const d = Math.abs(colCenters[k]-c.x);
+        if(d < best){ best=d; ci=k; }
+      }
+      row[ci] = row[ci] ? row[ci] + ' ' + c.text : c.text;
+    }
+    return row;
+  });
+
+  // Trim empty trailing rows
+  while(grid.length && grid[grid.length-1].every(c=>!String(c).trim())) grid.pop();
+  // Trim empty trailing columns
+  let maxCol = 0;
+  for(const r of grid) for(let c=0;c<r.length;c++) if(String(r[c]).trim()) maxCol=Math.max(maxCol,c);
+  const trimmed = grid.map(r=>r.slice(0,maxCol+1));
+
+  // Detect number format (per document text)
+  const allText = items.map(i=>i.text).join(' ');
+  let numFormat = 'auto';
+  if(/\d\.\d{3},\d/.test(allText)) numFormat = 'eu';
+  else if(/\d,\d{3}\.\d/.test(allText)) numFormat = 'us';
+
+  function parseNumber(str){
+    const t = str.trim();
+    if(t==='') return '';
+    const noSpace = t.replace(/\s/g,'');
+    let s = noSpace;
+    // preserve leading-zero codes (e.g. 0002, 00221556)
+    if(/^0\d/.test(s) && s!=='0') return t;
+    const hasComma = s.includes(',');
+    const hasDot = s.includes('.');
+    if(numFormat === 'eu'){
+      if(hasComma){ s = s.replace(/\./g,'').replace(',','.'); }
+      else if(hasDot && /^\d{1,3}(\.\d{3})+$/.test(s)){ s = s.replace(/\./g,''); }
+    } else if(numFormat === 'us'){
+      if(hasComma){ s = s.replace(/,/g,''); }
+    } else {
+      if(hasComma && hasDot){
+        if(s.lastIndexOf(',') > s.lastIndexOf('.')){ s = s.replace(/\./g,'').replace(',','.'); }
+        else { s = s.replace(/,/g,''); }
+      } else if(hasComma && !hasDot){
+        if(/^\d{1,3}(,\d{3})+$/.test(s)){ s = s.replace(/,/g,''); }
+        else { s = s.replace(',','.'); }
+      } else if(hasDot && !hasComma){
+        if(/^\d{1,3}(\.\d{3})+$/.test(s)){ s = s.replace(/\./g,''); }
+      }
+    }
+    if(/^[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?$/.test(s) && s!=='' && s!=='.' && s!=='-' && s!=='+' ){
+      const n = Number(s);
+      if(isFinite(n)) return n;
+    }
+    return t;
+  }
+
+  const typed = trimmed.map(r=>r.map(v=> parseNumber(String(v))));
+  const record = {
+    pageNum,
+    width, height,
+    sourceType,
+    numFormat,
+    itemsCount: items.length,
+    lines: lineCells.map(lc=>({ y: lc.y, cells: lc.cells.map(c=>({ x: c.x, text: c.text })) })),
+    columns: colCenters,
+    grid: typed,
+    rows: typed.length,
+    cols: (typed[0]?.length||0)
+  };
+  pagesData.push(record);
+  log('Trang ' + pageNum + ': ' + typed.length + ' dòng, ' + (typed[0]?.length||0) + ' cột. [' + sourceType + ']');
+}
+
 async function analyze(){
-  if(!pdfDoc){ log('Chưa có PDF.', 'err'); return; }
   pagesData = [];
   setProgress(0);
   log('Bắt đầu phân tích...');
-  const COL_TOL = 16, ROW_TOL = 10;
-  for(let p=1; p<=pdfDoc.numPages; p++){
-    const page = await pdfDoc.getPage(p);
-    setProgress(Math.round((p-1)/pdfDoc.numPages*100));
-    log('Trang ' + p + ': đang trích xuất...');
-    const items = await extractPageItems(page, p);
-    if(items.length===0){ log('Trang ' + p + ' không có text (PDF scan và OCR thất bại).', 'err'); continue; }
-    items.sort((a,b)=> a.y===b.y ? a.x-b.x : a.y-b.y);
-    // ---- Group into lines by Y ----
-    const lines = [];
-    for(const it of items){
-      const last = lines[lines.length-1];
-      if(last && Math.abs(last.y - it.y) <= ROW_TOL){
-        last.items.push(it);
-        last.y = (last.y + it.y)/2;
-      } else {
-        lines.push({ y: it.y, items: [it] });
-      }
+  if(fileType === 'pdf'){
+    if(!pdfDoc){ log('Chưa có PDF.', 'err'); return; }
+    for(let p=1; p<=pdfDoc.numPages; p++){
+      const page = await pdfDoc.getPage(p);
+      setProgress(Math.round((p-1)/pdfDoc.numPages*100));
+      log('Trang ' + p + ': đang trích xuất...');
+      const res = await extractPdfPage(page, p);
+      if(!res.items.length){ log('Trang ' + p + ' không có text (PDF scan và OCR thất bại).', 'err'); continue; }
+      processPage(p, res.items, res.width, res.height, res.sourceType);
+      setProgress(Math.round(p/pdfDoc.numPages*100));
     }
-    // sort items in each line by x
-    for(const ln of lines) ln.items.sort((a,b)=>a.x-b.x);
-
-    // ---- Split each line into cells by large horizontal gaps ----
-    const GAP_SPLIT = 15;
-    const lineCells = lines.map(ln => {
-      const cells = [];
-      let cur = [ln.items[0]];
-      for(let i=1;i<ln.items.length;i++){
-        const prev = ln.items[i-1];
-        const gap = ln.items[i].x - (prev.x + (prev.w||0));
-        if(gap > GAP_SPLIT){
-          cells.push(cur); cur = [ln.items[i]];
-        } else {
-          cur.push(ln.items[i]);
-        }
-      }
-      if(cur.length) cells.push(cur);
-      return { y: ln.y, cells: cells.map(c => ({ x: c[0].x, text: c.map(i=>i.text).join(' ').trim() })) };
-    }).filter(lc => lc.cells.some(c=>c.text.trim()));
-
-    // ---- Cluster column boundaries across all lines ----
-    const boundaries = [];
-    for(const lc of lineCells) for(const c of lc.cells) boundaries.push(c.x);
-    boundaries.sort((a,b)=>a-b);
-    const colCenters = [];
-    for(const x of boundaries){
-      if(!colCenters.length || x - colCenters[colCenters.length-1] > COL_TOL){
-        colCenters.push(x);
-      } else {
-        colCenters[colCenters.length-1] = (colCenters[colCenters.length-1]+x)/2;
-      }
-    }
-
-    // ---- Build grid ----
-    const grid = lineCells.map(lc => {
-      const row = colCenters.map(()=>'');
-      for(const c of lc.cells){
-        // nearest column
-        let ci = 0, best = Infinity;
-        for(let k=0;k<colCenters.length;k++){
-          const d = Math.abs(colCenters[k]-c.x);
-          if(d < best){ best=d; ci=k; }
-        }
-        row[ci] = row[ci] ? row[ci] + ' ' + c.text : c.text;
-      }
-      return row;
-    });
-
-    // trim empty trailing rows/cols
-    while(grid.length && grid[grid.length-1].every(c=>!String(c).trim())) grid.pop();
-    let maxCol = 0;
-    for(const r of grid) for(let c=0;c<r.length;c++) if(String(r[c]).trim()) maxCol=Math.max(maxCol,c);
-    const trimmed = grid.map(r=>r.slice(0,maxCol+1));
-
-    // detect document number format
-    const allText = items.map(i=>i.text).join(' ');
-    let numFormat = 'auto';
-    if(/\d\.\d{3},\d/.test(allText)) numFormat = 'eu';
-    else if(/\d,\d{3}\.\d/.test(allText)) numFormat = 'us';
-
-    // number parsing: support both 1,234.56 and 1.234,56
-    function parseNumber(str){
-      const t = str.trim();
-      if(t==='') return '';
-      const noSpace = t.replace(/\s/g,'');
-      let s = noSpace;
-      // preserve leading-zero codes (e.g. 0002, 00221556)
-      if(/^0\d/.test(s) && s!=='0') return t;
-      const hasComma = s.includes(',');
-      const hasDot = s.includes('.');
-      if(numFormat === 'eu'){
-        if(hasComma){ s = s.replace(/\./g,'').replace(',','.'); }
-        else if(hasDot && /^\d{1,3}(\.\d{3})+$/.test(s)){ s = s.replace(/\./g,''); }
-      } else if(numFormat === 'us'){
-        if(hasComma){ s = s.replace(/,/g,''); }
-        // dot stays decimal
-      } else {
-        if(hasComma && hasDot){
-          if(s.lastIndexOf(',') > s.lastIndexOf('.')){ s = s.replace(/\./g,'').replace(',','.'); }
-          else { s = s.replace(/,/g,''); }
-        } else if(hasComma && !hasDot){
-          if(/^\d{1,3}(,\d{3})+$/.test(s)){ s = s.replace(/,/g,''); }
-          else { s = s.replace(',','.'); }
-        } else if(hasDot && !hasComma){
-          if(/^\d{1,3}(\.\d{3})+$/.test(s)){ s = s.replace(/\./g,''); }
-        }
-      }
-      if(/^[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?$/.test(s) && s!=='' && s!=='.' && s!=='-' && s!=='+' ){
-        const n = Number(s);
-        if(isFinite(n)) return n;
-      }
-      return t;
-    }
-
-    const typed = trimmed.map(r=>r.map(v=> parseNumber(String(v))));
-    pagesData.push({ pageNum:p, grid:typed, rows:typed.length, cols: (typed[0]?.length||0) });
-    setProgress(Math.round(p/pdfDoc.numPages*100));
-    log('Trang ' + p + ': ' + typed.length + ' dòng, ' + (typed[0]?.length||0) + ' cột.');
+  } else {
+    if(!imageFile){ log('Chưa có ảnh.', 'err'); return; }
+    setProgress(10);
+    log('Đang trích xuất ảnh...');
+    const res = await extractImageItems(imageFile);
+    if(!res.items.length){ log('Ảnh không có text (OCR thất bại).', 'err'); return; }
+    processPage(1, res.items, res.width, res.height, res.sourceType);
+    setProgress(100);
   }
   setProgress(100);
   log('Phân tích xong.', 'ok');
@@ -326,10 +398,12 @@ async function analyze(){
   showPreview();
 }
 
+$('btnAnalyze').addEventListener('click', analyze);
+
 function showInfo(){
   const totalRows = pagesData.reduce((a,p)=>a+p.rows,0);
-  const maxCols = Math.max(...pagesData.map(p=>p.cols));
-  $('info').innerHTML = pagesData.map(p=>`<span class="pill">Trang ${p.pageNum}: ${p.rows} dòng × ${p.cols} cột</span>`).join('') +
+  const maxCols = Math.max(0, ...pagesData.map(p=>p.cols));
+  $('info').innerHTML = pagesData.map(p=>`<span class="pill">Trang ${p.pageNum}: ${p.rows} dòng × ${p.cols} cột (${p.sourceType})</span>`).join('') +
     `<div style="margin-top:8px;color:var(--muted)">Tổng: ${pagesData.length} trang, ${totalRows} dòng, tối đa ${maxCols} cột.</div>`;
   $('infoCard').style.display='block';
 }
@@ -351,16 +425,14 @@ function showPreview(){
   $('preview').innerHTML = html;
   $('previewCard').style.display='block';
 }
-function escapeHtml(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
 // ---- Export Excel ----
 $('btnExcel').addEventListener('click', exportExcel);
 function exportExcel(){
   try {
     const wb = XLSX.utils.book_new();
-    pagesData.forEach((p, idx) => {
+    pagesData.forEach((p) => {
       const ws = XLSX.utils.aoa_to_sheet(p.grid);
-      // set column widths
       const ncols = p.grid.reduce((a,r)=>Math.max(a,r.length),0);
       ws['!cols'] = Array.from({length:ncols}, (_,c)=>{
         let max=8;
@@ -381,12 +453,10 @@ $('btnWord').addEventListener('click', exportWord);
 async function exportWord(){
   try {
     const { Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell, WidthType, HeadingLevel, PageBreak } = docx;
-    const sections = [];
     const children = [];
     pagesData.forEach((p, idx) => {
       if(idx>0) children.push(new Paragraph({children:[new PageBreak()]}));
       children.push(new Paragraph({ text: 'Trang ' + p.pageNum, heading: HeadingLevel.HEADING_2 }));
-      // decide table vs paragraphs
       const ncols = p.grid.reduce((a,r)=>Math.max(a,r.length),0);
       const nonEmptyRows = p.grid.filter(r=>r.some(c=>String(c).trim()!==''));
       const avgCols = nonEmptyRows.reduce((a,r)=>a + r.filter(c=>String(c).trim()!=='').length,0)/Math.max(nonEmptyRows.length,1);
@@ -411,6 +481,17 @@ async function exportWord(){
     downloadBlob(blob, 'converted.docx');
     log('Đã xuất Word.', 'ok');
   } catch(e){ log('Lỗi xuất Word: ' + e.message, 'err'); console.error(e); }
+}
+
+// ---- Export JSON ----
+$('btnJson').addEventListener('click', exportJson);
+function exportJson(){
+  try {
+    const data = { generatedAt: new Date().toISOString(), pages: pagesData };
+    const blob = new Blob([JSON.stringify(data, null, 2)], {type:'application/json'});
+    downloadBlob(blob, 'converted.json');
+    log('Đã xuất JSON.', 'ok');
+  } catch(e){ log('Lỗi xuất JSON: ' + e.message, 'err'); }
 }
 
 function downloadBlob(blob, name){
