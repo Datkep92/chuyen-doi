@@ -11,8 +11,8 @@ Trang HTML chạy hoàn toàn trên trình duyệt (không server, không upload
 
 ## Yêu cầu
 
-- Cần internet lần đầu để tải thư viện (pdf.js, SheetJS, docx.js, Tesseract.js) từ CDN; sau đó trình duyệt cache (offline).
-- PDF scan ảnh: tự động OCR bằng Tesseract.js (vie+eng). Độ chính xác OCR phụ thuộc chất lượng ảnh.
+- Cần internet lần đầu để tải thư viện (pdf.js, SheetJS, docx.js, PaddleOCR) từ CDN; sau đó trình duyệt cache (offline).
+- PDF scan ảnh: tự động OCR bằng PaddleOCR (PP-OCRv4). Độ chính xác OCR phụ thuộc chất lượng ảnh.
 
 ## Ghi chú
 

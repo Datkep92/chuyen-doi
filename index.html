@@ -42,7 +42,7 @@
     <label class="drop" id="drop">
       <input type="file" id="file" accept="application/pdf,.pdf">
       <div id="dropText">Kéo thả file PDF vào đây, hoặc bấm để chọn</div>
-      <div style="margin-top:8px;color:var(--muted);font-size:13px">Hỗ trợ PDF có text (không phải scan ảnh)</div>
+      <div style="margin-top:8px;color:var(--muted);font-size:13px">Hỗ trợ PDF có text hoặc scan ảnh (OCR tự động)</div>
     </label>
     <div class="row">
       <button class="btn" id="btnPick">📂 Chọn file PDF</button>
@@ -73,7 +73,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
 <script src="https://unpkg.com/docx@8.5.0/build/index.umd.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<!-- PaddleOCR được tải động qua ESM khi cần -->
 
 <script>
 const $ = id => document.getElementById(id);
@@ -116,14 +116,21 @@ function handleFile(f){
 $('btnAnalyze').addEventListener('click', analyze);
 $('btnReset').addEventListener('click', ()=>location.reload());
 
-let ocrWorker = null;
-async function getOcrWorker(){
-  if(ocrWorker) return ocrWorker;
-  log('Đang tải engine OCR (lần đầu có thể lâu)...');
-  ocrWorker = await Tesseract.createWorker('vie+eng', 1, {
-    logger: m => { if(m.status) log('OCR: ' + m.status + (m.progress? ' ' + Math.round(m.progress*100) + '%' : '')); }
+let ocrEngine = null;
+async function getOcrEngine(){
+  if(ocrEngine) return ocrEngine;
+  log('Đang tải engine OCR PaddleOCR (lần đầu có thể lâu)...');
+  const mod = await import('https://cdn.jsdelivr.net/npm/@gutenye/ocr-browser@1.4.9/+esm');
+  const Ocr = mod.default || mod.Ocr || mod;
+  ocrEngine = await Ocr.create({
+    models: {
+      detectionPath: 'models/ch_PP-OCRv4_det_infer.onnx',
+      recognitionPath: 'models/ch_PP-OCRv4_rec_infer.onnx',
+      dictionaryPath: 'models/ppocr_keys_v1.txt'
+    }
   });
-  return ocrWorker;
+  log('Engine OCR đã sẵn sàng.', 'ok');
+  return ocrEngine;
 }
 
 async function extractPageItems(page, pageNum){
@@ -145,33 +152,46 @@ async function extractPageItems(page, pageNum){
   // 2) Fallback OCR for scanned pages
   log('Trang ' + pageNum + ': ít text, dùng OCR...');
   try {
-    const w = await getOcrWorker();
+    const ocr = await getOcrEngine();
     const canvas = document.createElement('canvas');
     canvas.width = viewport.width; canvas.height = viewport.height;
     const ctx = canvas.getContext('2d');
     await page.render({canvasContext: ctx, viewport}).promise;
-    const { data } = await w.recognize(canvas);
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const result = await ocr.detect({ data: imageData.data, width: imageData.width, height: imageData.height });
     const ocrItems = [];
-    if(data && data.words){
-      for(const wd of data.words){
-        if(!wd.text || !wd.text.trim()) continue;
-        const b = wd.bbox;
-        ocrItems.push({ text: wd.text, x: b.x0, y: b.y0, w: b.x1-b.x0, h: b.y1-b.y0 });
+    const texts = (result && result.texts) ? result.texts : (Array.isArray(result) ? result : []);
+    for(const t of texts){
+      if(!t || !t.text || !t.text.trim()) continue;
+      let box = t.box;
+      if(!box || !box.length){
+        // fallback: use frame if provided
+        if(t.frame){
+          box = [
+            [t.frame.left, t.frame.top],
+            [t.frame.left + t.frame.width, t.frame.top],
+            [t.frame.left + t.frame.width, t.frame.top + t.frame.height],
+            [t.frame.left, t.frame.top + t.frame.height]
+          ];
+        }
       }
-    }
-    if(ocrItems.length===0 && data && data.text){
-      // fallback: split lines
-      const lines = data.text.split(/\n/);
-      let y = 20;
-      for(const ln of lines){
-        if(ln.trim()) ocrItems.push({ text: ln.trim(), x: 20, y, w: 10, h: 12 });
-        y += 16;
+      if(!box || !box.length){
+        ocrItems.push({ text: t.text.trim(), x: 20, y: 20, w: 10, h: 12 });
+        continue;
       }
+      const xs = box.map(p=>p[0]);
+      const ys = box.map(p=>p[1]);
+      const x = Math.min(...xs);
+      const y = Math.min(...ys);
+      const w = Math.max(...xs) - x;
+      const h = Math.max(...ys) - y;
+      ocrItems.push({ text: t.text.trim(), x, y, w: w||10, h: h||12 });
     }
-    log('Trang ' + pageNum + ': OCR (' + ocrItems.length + ' từ).');
+    log('Trang ' + pageNum + ': OCR (' + ocrItems.length + ' dòng).');
     return ocrItems;
   } catch(err){
     log('Trang ' + pageNum + ': OCR lỗi - ' + err.message, 'err');
+    console.error(err);
     return items;
   }
 }
