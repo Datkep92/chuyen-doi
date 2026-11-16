@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OCR Tiếng Việt — Tesseract.js</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 20px; background: #f5f5f7; color: #1d1d1f; }
+  .container { max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 24px; margin-bottom: 4px; }
+  .subtitle { color: #6e6e73; margin-bottom: 20px; font-size: 14px; }
+  .card { background: #fff; border-radius: 12px; padding: 20px; margin-bottom: 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
+  .upload-area { border: 2px dashed #d2d2d7; border-radius: 8px; padding: 40px; text-align: center; cursor: pointer; transition: border-color 0.2s; }
+  .upload-area:hover { border-color: #0071e3; }
+  .upload-area.dragover { border-color: #0071e3; background: #f0f7ff; }
+  input[type="file"] { display: none; }
+  .btn { background: #0071e3; color: #fff; border: none; padding: 10px 20px; border-radius: 8px; cursor: pointer; font-size: 15px; font-weight: 500; }
+  .btn:hover { background: #0077ed; }
+  .btn:disabled { background: #b0b0b5; cursor: not-allowed; }
+  .btn-secondary { background: #e8e8ed; color: #1d1d1f; }
+  .preview-row { display: flex; gap: 16px; flex-wrap: wrap; }
+  .preview-box { flex: 1; min-width: 280px; }
+  .preview-box img { max-width: 100%; border-radius: 8px; border: 1px solid #d2d2d7; }
+  .result-text { white-space: pre-wrap; font-size: 15px; line-height: 1.6; padding: 12px; background: #f5f5f7; border-radius: 8px; min-height: 60px; }
+  .status { font-size: 13px; color: #6e6e73; margin-top: 8px; }
+  .error { color: #ff3b30; }
+  .success { color: #34c759; }
+  .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid #d2d2d7; border-top-color: #0071e3; border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: middle; margin-right: 6px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .toolbar { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+  textarea { width: 100%; min-height: 80px; border: 1px solid #d2d2d7; border-radius: 8px; padding: 10px; font-size: 14px; font-family: inherit; resize: vertical; }
+  .progress-bar { width: 100%; height: 6px; background: #e8e8ed; border-radius: 3px; overflow: hidden; margin-top: 8px; }
+  .progress-fill { height: 100%; background: #0071e3; width: 0%; transition: width 0.3s; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>OCR Tiếng Việt — Tesseract.js</h1>
+  <p class="subtitle">Chạy hoàn toàn trên trình duyệt (WASM), không upload ảnh. Dùng model Vietnamese (vie.traineddata).</p>
+
+  <div class="card">
+    <div class="upload-area" id="uploadArea">
+      <p style="font-size:16px;margin-bottom:8px;">Kéo thả ảnh vào đây hoặc nhấn để chọn</p>
+      <p style="font-size:12px;color:#6e6e73;">Hỗ trợ PNG, JPG, JPEG, WebP — ảnh nhỏ sẽ tự upscale 2x</p>
+      <input type="file" id="fileInput" accept="image/*">
+    </div>
+    <div class="toolbar">
+      <button class="btn" id="ocrBtn" disabled>Nhận diện chữ</button>
+      <button class="btn btn-secondary" id="clearBtn">Xóa</button>
+    </div>
+    <div class="progress-bar" id="progressBar" style="display:none;"><div class="progress-fill" id="progressFill"></div></div>
+    <div class="status" id="status"></div>
+  </div>
+
+  <div class="preview-row">
+    <div class="preview-box card">
+      <h3 style="margin-top:0;">Ảnh gốc</h3>
+      <div id="imagePreview"><p style="color:#6e6e73;font-size:13px;">Chưa có ảnh</p></div>
+    </div>
+    <div class="preview-box card">
+      <h3 style="margin-top:0;">Kết quả OCR</h3>
+      <div class="result-text" id="resultText">Chưa có kết quả</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0;">Văn bản đã trích xuất (có thể chỉnh sửa / sao chép)</h3>
+    <textarea id="extractedText" placeholder="Văn bản nhận diện sẽ xuất hiện ở đây..."></textarea>
+    <div class="toolbar">
+      <button class="btn btn-secondary" id="copyBtn">Sao chép</button>
+      <button class="btn btn-secondary" id="downloadTxtBtn">Tải về .txt</button>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<script>
+const uploadArea = document.getElementById('uploadArea');
+const fileInput = document.getElementById('fileInput');
+const ocrBtn = document.getElementById('ocrBtn');
+const clearBtn = document.getElementById('clearBtn');
+const statusEl = document.getElementById('status');
+const imagePreview = document.getElementById('imagePreview');
+const resultText = document.getElementById('resultText');
+const extractedText = document.getElementById('extractedText');
+const progressBar = document.getElementById('progressBar');
+const progressFill = document.getElementById('progressFill');
+
+let currentFile = null;
+let currentImg = null;
+let worker = null;
+
+uploadArea.addEventListener('click', () => fileInput.click());
+uploadArea.addEventListener('dragover', (e) => { e.preventDefault(); uploadArea.classList.add('dragover'); });
+uploadArea.addEventListener('dragleave', () => uploadArea.classList.remove('dragover'));
+uploadArea.addEventListener('drop', (e) => {
+  e.preventDefault();
+  uploadArea.classList.remove('dragover');
+  if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener('change', (e) => {
+  if (e.target.files.length) handleFile(e.target.files[0]);
+});
+
+function handleFile(file) {
+  if (!file.type.startsWith('image/')) {
+    setStatus('Vui lòng chọn file ảnh.', 'error');
+    return;
+  }
+  currentFile = file;
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    const img = new Image();
+    img.onload = () => {
+      currentImg = img;
+      imagePreview.innerHTML = '<img src="' + e.target.result + '" alt="preview">';
+      ocrBtn.disabled = false;
+      setStatus('Ảnh đã tải. Nhấn "Nhận diện chữ" để bắt đầu.', 'success');
+    };
+    img.src = e.target.result;
+  };
+  reader.readAsDataURL(file);
+}
+
+function setStatus(msg, type) {
+  statusEl.innerHTML = msg;
+  statusEl.className = 'status ' + (type || '');
+}
+
+function preprocess(img) {
+  const MIN_HEIGHT = 1000;
+  const SCALE = img.naturalHeight < MIN_HEIGHT ? 2 : 1;
+  const canvas = document.createElement('canvas');
+  canvas.width = img.naturalWidth * SCALE;
+  canvas.height = img.naturalHeight * SCALE;
+  const ctx = canvas.getContext('2d');
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  return canvas;
+}
+
+async function getWorker() {
+  if (worker) return worker;
+  setStatus('<span class="spinner"></span>Đang tải model tiếng Việt (lần đầu, vài MB)...', '');
+  progressBar.style.display = 'block';
+  worker = await Tesseract.createWorker('vie', 1, {
+    logger: (m) => {
+      if (m.status === 'recognizing text') {
+        progressFill.style.width = (m.progress * 100) + '%';
+      }
+      setStatus('<span class="spinner"></span>' + m.status + ' ' + Math.round(m.progress * 100) + '%', '');
+    }
+  });
+  progressBar.style.display = 'none';
+  return worker;
+}
+
+ocrBtn.addEventListener('click', async () => {
+  if (!currentImg) return;
+  ocrBtn.disabled = true;
+  setStatus('<span class="spinner"></span>Đang chuẩn bị...', '');
+  resultText.textContent = 'Đang xử lý...';
+  extractedText.value = '';
+
+  try {
+    const canvas = preprocess(currentImg);
+    const w = await getWorker();
+    progressBar.style.display = 'block';
+    progressFill.style.width = '0%';
+    const { data } = await w.recognize(canvas, {}, {
+      // preserve line breaks
+    });
+    progressBar.style.display = 'none';
+    const text = (data.text || '').trim();
+    resultText.textContent = text || '(không nhận diện được chữ)';
+    extractedText.value = text;
+    setStatus('Nhận diện thành công.', 'success');
+  } catch (err) {
+    progressBar.style.display = 'none';
+    setStatus('Lỗi: ' + err.message, 'error');
+    resultText.textContent = 'Lỗi: ' + err.message;
+  } finally {
+    ocrBtn.disabled = false;
+  }
+});
+
+clearBtn.addEventListener('click', () => {
+  currentFile = null;
+  currentImg = null;
+  fileInput.value = '';
+  imagePreview.innerHTML = '<p style="color:#6e6e73;font-size:13px;">Chưa có ảnh</p>';
+  resultText.textContent = 'Chưa có kết quả';
+  extractedText.value = '';
+  ocrBtn.disabled = true;
+  setStatus('', '');
+  progressBar.style.display = 'none';
+});
+
+document.getElementById('copyBtn').addEventListener('click', () => {
+  extractedText.select();
+  document.execCommand('copy');
+  setStatus('Đã sao chép vào clipboard.', 'success');
+});
+
+document.getElementById('downloadTxtBtn').addEventListener('click', () => {
+  const blob = new Blob([extractedText.value], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'ocr_result.txt';
+  a.click();
+  URL.revokeObjectURL(url);
+});
+</script>
+</body>
+</html>
+PYEOF
+echo "written"
