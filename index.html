@@ -24,9 +24,10 @@
   .progress { height:8px; background:#334155; border-radius:4px; overflow:hidden; margin-top:12px; }
   .progress > div { height:100%; background:var(--accent); width:0%; transition:width .2s; }
   .log { font-family:monospace; font-size:12px; color:var(--muted); max-height:160px; overflow:auto; background:#0b1220; padding:10px; border-radius:8px; margin-top:10px; white-space:pre-wrap; }
-  .preview { max-height:400px; overflow:auto; background:#0b1220; padding:12px; border-radius:8px; font-size:13px; line-height:1.5; }
-  .preview table { border-collapse:collapse; width:100%; margin:8px 0; }
-  .preview td { border:1px solid #334155; padding:4px 6px; }
+  .preview { max-height:520px; overflow:auto; background:#0b1220; padding:12px; border-radius:8px; font-size:13px; line-height:1.5; }
+  .preview table { border-collapse:collapse; width:max-content; min-width:100%; margin:8px 0; }
+  .preview td, .preview th { border:1px solid #334155; padding:4px 6px; white-space:nowrap; vertical-align:top; }
+  .preview .docx-wrapper { background:#fff; color:#000; padding:16px; border-radius:8px; }
   .pill { display:inline-block; background:#334155; padding:2px 8px; border-radius:999px; font-size:12px; margin-right:6px; }
   .err { color:var(--err); }
   .ok { color:var(--ok); }
@@ -63,7 +64,12 @@
   </div>
 
   <div class="card" id="previewCard" style="display:none">
-    <h3 style="margin:0 0 8px">Xem trước (trang 1)</h3>
+    <h3 style="margin:0 0 8px">Xem trước</h3>
+    <div class="row" style="margin-bottom:8px">
+      <button class="btn secondary" id="btnPreviewData">Dữ liệu</button>
+      <button class="btn secondary" id="btnPreviewWord">Word</button>
+      <button class="btn secondary" id="btnPreviewExcel">Excel</button>
+    </div>
     <div class="preview" id="preview"></div>
   </div>
 
@@ -393,6 +399,9 @@ async function analyze(){
 }
 
 $('btnAnalyze').addEventListener('click', analyze);
+$('btnPreviewData').addEventListener('click', previewData);
+$('btnPreviewWord').addEventListener('click', previewWord);
+$('btnPreviewExcel').addEventListener('click', previewExcel);
 
 function showInfo(){
   const totalRows = pagesData.reduce((a,p)=>a+p.rows,0);
@@ -403,10 +412,15 @@ function showInfo(){
 }
 
 function showPreview(){
+  $('previewCard').style.display='block';
+  previewData();
+}
+
+function previewData(){
   const p = pagesData[0];
   if(!p) return;
   let html = '<table>';
-  const maxR = Math.min(p.grid.length, 25);
+  const maxR = Math.min(p.grid.length, 50);
   for(let r=0;r<maxR;r++){
     html += '<tr>';
     for(let c=0;c<p.grid[r].length;c++){
@@ -415,27 +429,86 @@ function showPreview(){
     html += '</tr>';
   }
   html += '</table>';
-  if(p.grid.length>25) html += '<div style="color:var(--muted)">... còn ' + (p.grid.length-25) + ' dòng</div>';
+  if(p.grid.length>maxR) html += '<div style="color:var(--muted)">... còn ' + (p.grid.length-maxR) + ' dòng</div>';
   $('preview').innerHTML = html;
-  $('previewCard').style.display='block';
+}
+
+function loadScript(src){
+  return new Promise((resolve, reject)=>{
+    const s = document.createElement('script');
+    s.src = src;
+    s.onload = resolve;
+    s.onerror = reject;
+    document.head.appendChild(s);
+  });
+}
+
+async function ensureDocxPreview(){
+  if(window.docxPreview && typeof window.docxPreview.renderAsync === 'function') return;
+  if(!window.JSZip){
+    await loadScript('https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js');
+  }
+  const saved = window.docx;
+  await loadScript('https://cdn.jsdelivr.net/npm/docx-preview@0.4.1/dist/docx-preview.min.js');
+  window.docxPreview = window.docx;
+  window.docx = saved;
+}
+
+async function previewWord(){
+  const preview = $('preview');
+  preview.innerHTML = '<div style="color:var(--muted)">Đang tạo bản xem trước Word...</div>';
+  try {
+    const blob = await buildWordBlob();
+    await ensureDocxPreview();
+    const wrap = document.createElement('div');
+    wrap.className = 'docx-wrapper';
+    preview.innerHTML = '';
+    preview.appendChild(wrap);
+    await window.docxPreview.renderAsync(blob, wrap);
+  } catch(e){
+    preview.innerHTML = '<span class="err">Lỗi xem trước Word: ' + escapeHtml(e.message||e) + '</span>';
+    console.error(e);
+  }
+}
+
+function previewExcel(){
+  const preview = $('preview');
+  try {
+    const wb = buildExcelWorkbook();
+    const name = wb.SheetNames[0];
+    const ws = wb.Sheets[name];
+    const html = XLSX.utils.sheet_to_html(ws, {id:'previewSheet'});
+    let out = html;
+    if(wb.SheetNames.length > 1){
+      out += '<div style="color:var(--muted);margin-top:8px">Đang xem sheet đầu: ' + escapeHtml(name) + ' (tổng ' + wb.SheetNames.length + ' sheet)</div>';
+    }
+    preview.innerHTML = out;
+  } catch(e){
+    preview.innerHTML = '<span class="err">Lỗi xem trước Excel: ' + escapeHtml(e.message||e) + '</span>';
+    console.error(e);
+  }
 }
 
 // ---- Export Excel ----
 $('btnExcel').addEventListener('click', exportExcel);
+function buildExcelWorkbook(){
+  const wb = XLSX.utils.book_new();
+  pagesData.forEach((p) => {
+    const ws = XLSX.utils.aoa_to_sheet(p.grid);
+    const ncols = p.grid.reduce((a,r)=>Math.max(a,r.length),0);
+    ws['!cols'] = Array.from({length:ncols}, (_,c)=>{
+      let max=8;
+      for(const r of p.grid) if(r[c]!=null){ const l=String(r[c]).length; if(l>max) max=Math.min(l,40); }
+      return {wch:max+2};
+    });
+    const name = 'Trang ' + p.pageNum;
+    XLSX.utils.book_append_sheet(wb, ws, name.slice(0,31));
+  });
+  return wb;
+}
 function exportExcel(){
   try {
-    const wb = XLSX.utils.book_new();
-    pagesData.forEach((p) => {
-      const ws = XLSX.utils.aoa_to_sheet(p.grid);
-      const ncols = p.grid.reduce((a,r)=>Math.max(a,r.length),0);
-      ws['!cols'] = Array.from({length:ncols}, (_,c)=>{
-        let max=8;
-        for(const r of p.grid) if(r[c]!=null){ const l=String(r[c]).length; if(l>max) max=Math.min(l,40); }
-        return {wch:max+2};
-      });
-      const name = 'Trang ' + p.pageNum;
-      XLSX.utils.book_append_sheet(wb, ws, name.slice(0,31));
-    });
+    const wb = buildExcelWorkbook();
     const out = XLSX.write(wb, {bookType:'xlsx', type:'array'});
     downloadBlob(new Blob([out], {type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}), 'converted.xlsx');
     log('Đã xuất Excel.', 'ok');
@@ -444,34 +517,37 @@ function exportExcel(){
 
 // ---- Export Word ----
 $('btnWord').addEventListener('click', exportWord);
+async function buildWordBlob(){
+  const { Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell, WidthType, HeadingLevel, PageBreak } = docx;
+  const children = [];
+  pagesData.forEach((p, idx) => {
+    if(idx>0) children.push(new Paragraph({children:[new PageBreak()]}));
+    children.push(new Paragraph({ text: 'Trang ' + p.pageNum, heading: HeadingLevel.HEADING_2 }));
+    const ncols = p.grid.reduce((a,r)=>Math.max(a,r.length),0);
+    const nonEmptyRows = p.grid.filter(r=>r.some(c=>String(c).trim()!==''));
+    const avgCols = nonEmptyRows.reduce((a,r)=>a + r.filter(c=>String(c).trim()!=='').length,0)/Math.max(nonEmptyRows.length,1);
+    const isTable = ncols >= 2 && nonEmptyRows.length>=2 && avgCols >= 1.5;
+    if(isTable){
+      const rows = nonEmptyRows.map(r => new TableRow({
+        children: Array.from({length:ncols}, (_,c) => new TableCell({
+          children: [ new Paragraph({ children:[ new TextRun({ text: String(r[c]??'') }) ] }) ],
+          width: { size: Math.floor(9000/ncols), type: WidthType.DXA }
+        }))
+      }));
+      children.push(new Table({ rows, width:{size:9000, type:WidthType.DXA} }));
+    } else {
+      for(const r of p.grid){
+        const line = r.map(c=>String(c)).join(' ').trim();
+        if(line) children.push(new Paragraph({ children:[ new TextRun(line) ] }));
+      }
+    }
+  });
+  const documentObj = new Document({ sections:[{ children }] });
+  return await Packer.toBlob(documentObj);
+}
 async function exportWord(){
   try {
-    const { Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell, WidthType, HeadingLevel, PageBreak } = docx;
-    const children = [];
-    pagesData.forEach((p, idx) => {
-      if(idx>0) children.push(new Paragraph({children:[new PageBreak()]}));
-      children.push(new Paragraph({ text: 'Trang ' + p.pageNum, heading: HeadingLevel.HEADING_2 }));
-      const ncols = p.grid.reduce((a,r)=>Math.max(a,r.length),0);
-      const nonEmptyRows = p.grid.filter(r=>r.some(c=>String(c).trim()!==''));
-      const avgCols = nonEmptyRows.reduce((a,r)=>a + r.filter(c=>String(c).trim()!=='').length,0)/Math.max(nonEmptyRows.length,1);
-      const isTable = ncols >= 2 && nonEmptyRows.length>=2 && avgCols >= 1.5;
-      if(isTable){
-        const rows = nonEmptyRows.map(r => new TableRow({
-          children: Array.from({length:ncols}, (_,c) => new TableCell({
-            children: [ new Paragraph({ children:[ new TextRun({ text: String(r[c]??'') }) ] }) ],
-            width: { size: Math.floor(9000/ncols), type: WidthType.DXA }
-          }))
-        }));
-        children.push(new Table({ rows, width:{size:9000, type:WidthType.DXA} }));
-      } else {
-        for(const r of p.grid){
-          const line = r.map(c=>String(c)).join(' ').trim();
-          if(line) children.push(new Paragraph({ children:[ new TextRun(line) ] }));
-        }
-      }
-    });
-    const doc = new Document({ sections:[{ children }] });
-    const blob = await Packer.toBlob(doc);
+    const blob = await buildWordBlob();
     downloadBlob(blob, 'converted.docx');
     log('Đã xuất Word.', 'ok');
   } catch(e){ log('Lỗi xuất Word: ' + e.message, 'err'); console.error(e); }
