@@ -67,14 +67,14 @@
     <div class="preview" id="preview"></div>
   </div>
 
-  <footer>Powered by pdf.js · SheetJS · docx.js · PaddleOCR — chạy local, dữ liệu không rời máy.</footer>
+  <footer>Powered by pdf.js · SheetJS · docx.js · Tesseract.js — chạy local, dữ liệu không rời máy.</footer>
 </div>
 
 <!-- Libraries -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
 <script src="https://unpkg.com/docx@8.5.0/build/index.umd.js"></script>
-<!-- PaddleOCR được tải động qua ESM khi cần -->
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -137,47 +137,43 @@ function handleFile(f){
 
 async function getOcrEngine(){
   if(ocrEngine) return ocrEngine;
-  log('Đang tải engine OCR PaddleOCR (lần đầu có thể lâu)...');
-  const mod = await import('https://cdn.jsdelivr.net/npm/@gutenye/ocr-browser@1.4.9/+esm');
-  const Ocr = mod.default || mod.Ocr || mod;
-  ocrEngine = await Ocr.create({
-    models: {
-      detectionPath: 'models/ch_PP-OCRv4_det_infer.onnx',
-      recognitionPath: 'models/ch_PP-OCRv4_rec_infer.onnx',
-      dictionaryPath: 'models/ppocr_keys_v1.txt'
-    }
-  });
+  log('Đang tải engine OCR Tesseract.js (lần đầu có thể lâu)...');
+  if(typeof Tesseract === 'undefined'){
+    await new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = 'https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js';
+      s.onload = resolve; s.onerror = reject;
+      document.head.appendChild(s);
+    });
+  }
+  ocrEngine = await Tesseract.createWorker('vie', 1, { logger: () => {} });
   log('Engine OCR đã sẵn sàng.', 'ok');
   return ocrEngine;
 }
 
 function mapOcrResult(result){
-  const texts = (result && result.texts) ? result.texts : (Array.isArray(result) ? result : []);
+  const words = (result && result.data && Array.isArray(result.data.words)) ? result.data.words : [];
   const out = [];
-  for(const t of texts){
-    if(!t || !t.text || !t.text.trim()) continue;
-    let box = t.box;
-    if(!box || !box.length){
-      if(t.frame){
-        box = [
-          [t.frame.left, t.frame.top],
-          [t.frame.left + t.frame.width, t.frame.top],
-          [t.frame.left + t.frame.width, t.frame.top + t.frame.height],
-          [t.frame.left, t.frame.top + t.frame.height]
-        ];
-      }
+  for(const w of words){
+    if(!w || !w.text || !w.text.trim()) continue;
+    const b = w.bbox || {};
+    const x = (typeof b.x0 === 'number') ? b.x0 : 0;
+    const y = (typeof b.y0 === 'number') ? b.y0 : 0;
+    const x1 = (typeof b.x1 === 'number') ? b.x1 : x + 10;
+    const y1 = (typeof b.y1 === 'number') ? b.y1 : y + 12;
+    out.push({ text: w.text.trim(), x, y, w: Math.max(1, x1-x), h: Math.max(1, y1-y) });
+  }
+  if(!out.length){
+    const lines = (result && result.data && Array.isArray(result.data.lines)) ? result.data.lines : [];
+    for(const ln of lines){
+      if(!ln || !ln.text || !ln.text.trim()) continue;
+      const b = ln.bbox || {};
+      const x = (typeof b.x0 === 'number') ? b.x0 : 0;
+      const y = (typeof b.y0 === 'number') ? b.y0 : 0;
+      const x1 = (typeof b.x1 === 'number') ? b.x1 : x + 10;
+      const y1 = (typeof b.y1 === 'number') ? b.y1 : y + 12;
+      out.push({ text: ln.text.trim(), x, y, w: Math.max(1, x1-x), h: Math.max(1, y1-y) });
     }
-    if(!box || !box.length){
-      out.push({ text: t.text.trim(), x: 20, y: 20, w: 10, h: 12 });
-      continue;
-    }
-    const xs = box.map(p=>p[0]);
-    const ys = box.map(p=>p[1]);
-    const x = Math.min(...xs);
-    const y = Math.min(...ys);
-    const w = Math.max(...xs) - x;
-    const h = Math.max(...ys) - y;
-    out.push({ text: t.text.trim(), x, y, w: w||10, h: h||12 });
   }
   return out;
 }
@@ -206,8 +202,7 @@ async function extractPdfPage(page, pageNum){
     canvas.width = viewport.width; canvas.height = viewport.height;
     const ctx = canvas.getContext('2d');
     await page.render({canvasContext: ctx, viewport}).promise;
-    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    const result = await ocr.detect({ data: imageData.data, width: imageData.width, height: imageData.height });
+    const result = await ocr.recognize(canvas);
     const ocrItems = mapOcrResult(result);
     log('Trang ' + pageNum + ': OCR (' + ocrItems.length + ' dòng).');
     return { items: ocrItems, sourceType:'pdf-scan', width: viewport.width, height: viewport.height };
@@ -231,9 +226,8 @@ async function extractImageItems(file){
   const ctx = canvas.getContext('2d');
   ctx.drawImage(img, 0, 0);
   URL.revokeObjectURL(url);
-  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
   const ocr = await getOcrEngine();
-  const result = await ocr.detect({ data: imageData.data, width: imageData.width, height: imageData.height });
+  const result = await ocr.recognize(canvas);
   const items = mapOcrResult(result);
   log('Ảnh: OCR (' + items.length + ' dòng).');
   return { items, sourceType:'image', width: canvas.width, height: canvas.height };
